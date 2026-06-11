@@ -1,0 +1,237 @@
+---
+title: "Spatial analysis and regression"
+author: 
+  name: Arman Shaid
+  affiliation: Oregon State University
+date: "22 May 2026"  # can also use: # </br>`r format(Sys.time(), '%d %B %Y')`
+output:
+  html_document:
+    theme: flatly  # you can experiment with other themes! for example, yeti
+    highlight: haddock 
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+    keep_md: true
+---
+
+```{r setup, include=FALSE}
+# these next lines set the default behavior for all R chunks in the .Rmd document.
+# for more information: https://yihui.org/rmarkdown/r-code
+knitr::opts_chunk$set(
+  echo = TRUE,  # show all R output
+  cache = TRUE,  # can set equal to TRUE to cache results and increase performance
+  message = FALSE  # suppress messages (e.g. about namespace conflicts)
+  ) 
+knitr::opts_chunk$set(cache=TRUE) 
+```
+
+## Goal and requirements
+
+The goal of this assignment is to practice spatial analysis and regression tools. 
+
+Some additional points:  
+
+- You can create a new GitHub repo for this assignment.  
+- Name your GitHub repo something like `aec699-hw3-spatial-lastname`.  
+- Make sure to organize your data into a `raw_data/` folder and your code into a `scripts/` or `code/` folder.  
+- Do not forget to knit the assignment (click the “Knit” button, or press `Ctrl+Shift+K`) before submitting.  
+- **Please put your (written) answers in bold.**  
+
+### What you will be graded on
+
+- Is the code correct?  
+- Are the outcomes correct?  
+- Did you show your work?  
+- Are the figures clear?  
+- Did you come up with creative empirical tests?  
+- Did you follow the instructions of the assignment?  
+
+## Preliminaries
+
+### Load libraries
+
+It is a good idea to load your libraries at the top of the Rmd document so that everyone can see what you are using. Similarly, it is good practice to set this type of chunk with `cache=FALSE` to ensure that the libraries are dynamically loaded each time you knit the document.
+
+*Hint: I have only added the libraries needed to download and read the data. You will need to load additional libraries to complete this assignment. Add them here once you discover that you need them.* 
+
+```{r libs, cache=FALSE}
+if (!require("pacman")) install.packages("pacman")  # install the pacman package if necessary
+pacman::p_load(here,tidyverse)  # install other packages using pacman::p_load()
+`%ni%` <- Negate(`%in%`)  # "not in" function
+```
+
+### Read in the data
+
+The following chunks will set up the file structure for the assignment. Adjust to make sure it matches your working directory. 
+
+```{r set_direc, output=FALSE}
+# set up folders
+if (!dir.exists(here("raw_data"))) dir.create(here("raw_data"))
+if (!dir.exists(here("raw_data/census"))) dir.create(here("raw_data/census"))
+if (!dir.exists(here("raw_data/prism"))) dir.create(here("raw_data/prism"))
+if (!dir.exists(here("raw_data/prism/normal"))) dir.create(here("raw_data/prism/normal"))
+if (!dir.exists(here("raw_data/prism/tmax"))) dir.create(here("raw_data/prism/tmax"))
+```
+
+This next chunk sets a .gitignore file for your repo. It ensures that raw data does not get uploaded to your GitHub repo. The first part checks if you already have a .gitignore file (which is a good idea). The second part creates a .gitignore file for you if not. You will know it is working if you do not have any raw data files in your "Git" pane in RStudio. 
+
+```{r gitignore}
+if (file.exists(".gitignore")) {
+  gitignore_contents <- read_lines(".gitignore")
+  if ("raw_data/" %ni% gitignore_contents) {
+    write_lines("raw_data/",".gitignore",append=T)
+  }
+} else {
+  write_lines("raw_data/",".gitignore")
+}
+```
+
+The next line reads in some county population data from the US Census. I have pre-cleaned it. You might consider moving it to your newly created `raw_data` folder. 
+
+```{r census_pop}
+county_pop <- read_csv(here("raw_data/county_pop.csv"))
+```
+
+Next, we will read in a county shapefile from the US Census. 
+
+```{r census_shp}
+download.file("https://www2.census.gov/geo/tiger/GENZ2020/shp/cb_2020_us_county_20m.zip",
+              here("raw_data/census/cb_2020_us_county_20m.zip"))
+unzip(here("raw_data/census/cb_2020_us_county_20m.zip"),exdir=here("raw_data/census"))
+```
+
+Lastly, we will use a few rasters from the [PRISM weather data](https://prism.oregonstate.edu), which is maintained at Oregon State University. This data is the most widely used climate data for United States-focused research, for example appearing in seminal climate economics papers like Schlenker and Roberts (2009) and Deschênes and Greenstone (2011). We will read in rasters for *climate normals*, which is the average temperature over 1990 to 2020, as well as *realized daily maximum temperature*. Both of these rasters are reported at a monthly level. We will pull information for January and July as representative "winter" and "summer" months. 
+
+```{r prism}
+months <- str_pad(c(1,7),width=2,pad="0")
+norm_file_src <- 
+  paste0(
+    "https://data.prism.oregonstate.edu/normals/us/4km/tmax/monthly/prism_tmax_us_25m_2020",
+    months,
+    "_avg_30y.zip"
+  )
+norm_file_dest <-
+  paste0(
+    here("raw_data/prism/normal/prism_tmax_us_25m_2020"),
+    months,
+    "_avg_30y.zip"
+  )
+tmax_file_src <-
+  paste0(
+    "https://data.prism.oregonstate.edu/time_series/us/an/4km/tmax/monthly/2025/prism_tmax_us_25m_2025",
+    months,
+    ".zip"
+  )
+tmax_file_dest <-
+  paste0(
+    here("raw_data/prism/tmax/prism_tmax_us_25m_2025"),
+    months,
+    ".zip"
+  )
+for (i in 1:length(norm_file_src)){
+  download.file(norm_file_src[i], norm_file_dest[i])
+  unzip(norm_file_dest[i],exdir=here("raw_data/prism/normal"))
+  download.file(tmax_file_src[i], tmax_file_dest[i])
+  unzip(tmax_file_dest[i],exdir=here("raw_data/prism/tmax"))
+}
+```
+
+We are now ready to go.
+
+## (1) Reading and cleaning our data
+
+The main goal of the assignment is to practice spatial analysis and regression tools. The running example will relate climate to population growth in the contiguous United States. I am not saying any of these analyses are robust, but they are good practice for our data skills. 
+
+### (1a) County shapefile
+
+For the first part, read in the county shapefile. Print its output. 
+
+*Hint: The relevant function is sf::read_sf().*
+
+**Written answer.**
+
+### (1b) Limiting to the contiguous United States
+
+We will limit attention to the contiguous United States. Investigate if there are any extra states in your data and get rid of the non-contiguous states. (You can keep DC. It is contiguous.) Confirm that you have restricted attention to the contiguous United States with a simple ggplot. It does not need to be pretty. We are just exploring data at this stage.
+
+**Written answer here.**
+
+### (1c) Verifying information about the data
+
+What coordinate reference system are the data in? How do you know? 
+
+**Written answer here.**
+
+### (1d) Reprojecting our data
+
+Reproject the county data into a flat projection. I suggest US Albers Equal Area Conic ("EPSG:5070"). While you are at it, arrange the data by `GEOID`, which is the 5-digit county FIPS code. You should be able to pipe it so it is one command. Confirm the coordinate reference system with `st_crs()`. 
+
+**Written answer here.**
+
+### (1e) Matching climate data to our counties
+
+Write a function that reads in the monthly climate normals and temperature data. You should compute zonal statistics for counties to report the average climate normal over 1990-2020 and the average temperature in 2025. Do not forget to put things in consistent coordinate reference systems. You should have 2 months per county. Print your dataframe when done. 
+
+*Hint: Use lapply() %>% bind_rows() or a purrr equivalent to create a county x month panel.*
+
+**Written answer here.**
+
+### (1f) Spatial object
+
+Join the zonal statistics to the county shapefile if you have not already. Make a conscious choice about whether to store your data in a wide or long format. Print the data and make sure the output shows the relevant data columns. 
+
+**Written answer here.**
+
+## (2) Presenting your data
+
+### (2a) January climate normal
+
+Map the January climate normal from 1990 to 2020 at the county level. Make the map presentable. You can use nicer color scales than the default; consider `scale_fill_viridis_c()`, for example. You might also center the title using `theme()` commands. Or, you could get rid of the grid lines and axis text. It is up to you. 
+
+Which areas have the harshest winters? 
+
+**Written answer here.**
+
+### (2b) July climate normal
+
+Map the July climate normal from 1990 to 2020. Make the map presentable. Which areas have the mildest summers? 
+
+**Written answer here.**
+
+### (2c) January 2025
+
+Map the difference between January 2025 and the climate normal for 1990 to 2020. Which areas had a relatively warm January? 
+
+**Written answer here.**
+
+### (2d) July 2025
+
+Map the difference between July 2025 and the climate normal for 1990 to 2020. Which areas had a relatively warm July? 
+
+**Written answer here.**
+
+## (3) Relating population growth to climate
+
+### (3a) Merging population
+
+It is a good idea to create a non-spatial dataframe for the regression work we will do. Create a new dataframe (something like `county_df`) where you use `st_drop_geometry()` to get rid of the spatial elements from the county shapefile. Merge the population on. You can also consider dropping extraneous columns. Print your data. 
+
+**Written answer here.**
+
+### (3b) Regressing population change on climate
+
+Run three regressions. First, regress the percent population change from 2000 to 2020 on January climate normal plus January climate normal squared. Next, do the same for July. Finally, include all of the variables (January and July) in a third regression. Output the results to a regression table. Can you conclude anything from these regressions? 
+
+**Written answer here.**
+
+### (3c) Investigating "warming" and population growth
+
+Consider an "ad hoc" measure of warming, which is the 2025 temperature minus the 1990-2020 normal. Does this measure correlate with population change for either January or July "warming"? Is this enough evidence to say anything about warming and population growth with this "ad hoc" measure? Use a regression table like in (3d) to provide an answer. 
+
+**Written answer here.**
+
+### (3d) A more sophisticated approach
+
+Come up with a more sophisticated econometric method than just regressing on temperature + temperature squared. Present the results in a figure or table. 
+
+**Written answer here.**
