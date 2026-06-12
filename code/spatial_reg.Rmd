@@ -3,7 +3,7 @@ title: "Spatial analysis and regression"
 author: 
   name: Arman Shaid
   affiliation: Oregon State University
-date: "22 May 2026"  # can also use: # </br>`r format(Sys.time(), '%d %B %Y')`
+date: "</br>`r format(Sys.time(), '%d %B %Y')`"  # can also use: # </br>`r format(Sys.time(), '%d %B %Y')`
 output:
   html_document:
     theme: flatly  # you can experiment with other themes! for example, yeti
@@ -56,7 +56,7 @@ It is a good idea to load your libraries at the top of the Rmd document so that 
 
 ```{r libs, cache=FALSE}
 if (!require("pacman")) install.packages("pacman")  # install the pacman package if necessary
-pacman::p_load(here,tidyverse)  # install other packages using pacman::p_load()
+pacman::p_load(here,tidyverse,sf,terra,exactextractr,modelsummary)  # install other packages using pacman::p_load()
 `%ni%` <- Negate(`%in%`)  # "not in" function
 ```
 
@@ -148,90 +148,377 @@ For the first part, read in the county shapefile. Print its output.
 
 *Hint: The relevant function is sf::read_sf().*
 
-**Written answer.**
+```{r read_counties}
+counties <- sf::read_sf(here("raw_data/census/cb_2020_us_county_20m.shp"))
+counties
+```
+
+**The county shapefile contains `r nrow(counties)` county-level polygons with attributes including `GEOID` (5-digit county FIPS), `STATEFP`, `NAME`, and the `geometry` column. The data are stored as an `sf` MULTIPOLYGON object.**
 
 ### (1b) Limiting to the contiguous United States
 
 We will limit attention to the contiguous United States. Investigate if there are any extra states in your data and get rid of the non-contiguous states. (You can keep DC. It is contiguous.) Confirm that you have restricted attention to the contiguous United States with a simple ggplot. It does not need to be pretty. We are just exploring data at this stage.
 
-**Written answer here.**
+```{r check_states}
+# all STATEFP codes present in the shapefile
+counties %>% st_drop_geometry() %>% distinct(STATEFP) %>% arrange(STATEFP)
+```
+
+```{r drop_noncontig}
+# non-contiguous STATEFP codes:
+#   "02" Alaska, "15" Hawaii, "72" Puerto Rico,
+#   "60" American Samoa, "66" Guam, "69" N. Mariana Is., "78" U.S. Virgin Is.
+non_contig <- c("02","15","60","66","69","72","78")
+
+counties <- counties %>% filter(STATEFP %ni% non_contig)
+```
+
+```{r plot_contig}
+ggplot(counties) +
+  geom_sf(fill = NA, color = "gray40", size = 0.1)
+```
+
+**The raw shapefile included Alaska (`02`), Hawaii (`15`), Puerto Rico (`72`), and other non-contiguous territories. I dropped these `STATEFP` codes, keeping DC (`11`) since it is contiguous. The ggplot confirms the data are restricted to the lower 48 + DC.**
 
 ### (1c) Verifying information about the data
 
-What coordinate reference system are the data in? How do you know? 
+What coordinate reference system are the data in? How do you know?
 
-**Written answer here.**
+```{r check_crs}
+st_crs(counties)
+```
+
+**The data are in NAD83 (EPSG:4269), a geographic coordinate system in degrees of latitude/longitude. I know this from two sources: (1) `st_crs(counties)` reports the CRS name and EPSG code directly, and (2) the shapefile bundle includes a `.prj` sidecar file (`cb_2020_us_county_20m.prj`) with the WKT definition, which `sf::read_sf()` reads automatically when loading the shapefile.**
 
 ### (1d) Reprojecting our data
 
-Reproject the county data into a flat projection. I suggest US Albers Equal Area Conic ("EPSG:5070"). While you are at it, arrange the data by `GEOID`, which is the 5-digit county FIPS code. You should be able to pipe it so it is one command. Confirm the coordinate reference system with `st_crs()`. 
+Reproject the county data into a flat projection. I suggest US Albers Equal Area Conic ("EPSG:5070"). While you are at it, arrange the data by `GEOID`, which is the 5-digit county FIPS code. You should be able to pipe it so it is one command. Confirm the coordinate reference system with `st_crs()`.
 
-**Written answer here.**
+```{r reproject}
+counties <- counties %>%
+  st_transform(crs = 5070) %>%
+  arrange(GEOID)
+
+st_crs(counties)
+```
+
+**I reprojected the counties to US Albers Equal Area Conic (EPSG:5070) with `st_transform()` and sorted by `GEOID` in a single piped command. `st_crs()` confirms the new CRS is "NAD83 / Conus Albers" (EPSG:5070).**
 
 ### (1e) Matching climate data to our counties
 
-Write a function that reads in the monthly climate normals and temperature data. You should compute zonal statistics for counties to report the average climate normal over 1990-2020 and the average temperature in 2025. Do not forget to put things in consistent coordinate reference systems. You should have 2 months per county. Print your dataframe when done. 
+Write a function that reads in the monthly climate normals and temperature data. You should compute zonal statistics for counties to report the average climate normal over 1990-2020 and the average temperature in 2025. Do not forget to put things in consistent coordinate reference systems. You should have 2 months per county. Print your dataframe when done.
 
 *Hint: Use lapply() %>% bind_rows() or a purrr equivalent to create a county x month panel.*
 
-**Written answer here.**
+```{r zonal_fn}
+get_climate_month <- function(mo) {
+  norm_path <- here(
+    "raw_data/prism/normal",
+    paste0("prism_tmax_us_25m_2020", mo, "_avg_30y.tif")
+  )
+  tmax_path <- here(
+    "raw_data/prism/tmax",
+    paste0("prism_tmax_us_25m_2025", mo, ".tif")
+  )
+
+  norm_r <- terra::rast(norm_path)
+  tmax_r <- terra::rast(tmax_path)
+
+  # reproject counties to the raster CRS
+  counties_r <- st_transform(counties, crs = st_crs(norm_r))
+
+  tibble(
+    GEOID       = counties_r$GEOID,
+    month       = as.integer(mo),
+    tmax_normal = exact_extract(norm_r, counties_r, "mean", progress = FALSE),
+    tmax_2025   = exact_extract(tmax_r, counties_r, "mean", progress = FALSE)
+  )
+}
+```
+
+```{r zonal_run}
+climate_df <- lapply(c("01","07"), get_climate_month) %>% bind_rows()
+climate_df
+```
+
+**To build the county × month panel, I wrote a function get_climate_month() that takes a month string ("01" or "07") and does three things. First, it loads the matching PRISM rasters — the 1990–2020 climate normal and the 2025 monthly tmax. Second, it reprojects the county polygons into the raster's CRS so the two layers line up before any zonal computation. Third, it calls exactextractr::exact_extract() with "mean" to get the area-weighted average tmax inside each county, which is more accurate than nearest-cell extraction because it weights each grid cell by the fraction it overlaps with the polygon. I then ran the function over January and July and combined the outputs with bind_rows(). The result is a long panel with two rows per county — one for winter, one for summer — and columns for the GEOID, the month, the climate normal, and the 2025 realized tmax.**
 
 ### (1f) Spatial object
 
-Join the zonal statistics to the county shapefile if you have not already. Make a conscious choice about whether to store your data in a wide or long format. Print the data and make sure the output shows the relevant data columns. 
+Join the zonal statistics to the county shapefile if you have not already. Make a conscious choice about whether to store your data in a wide or long format. Print the data and make sure the output shows the relevant data columns.
 
-**Written answer here.**
+```{r pivot_wide}
+climate_wide <- climate_df %>%
+  pivot_wider(
+    id_cols     = GEOID,
+    names_from  = month,
+    values_from = c(tmax_normal, tmax_2025),
+    names_glue  = "{.value}_{sprintf('%02d', month)}"
+  )
+climate_wide
+```
+
+```{r join_counties}
+counties <- counties %>% left_join(climate_wide, by = "GEOID")
+
+counties %>%
+  select(GEOID, NAME, STATEFP,
+         tmax_normal_01, tmax_normal_07,
+         tmax_2025_01,   tmax_2025_07,
+         geometry)
+```
+
+**I chose wide format. Each county now appears in a single row with four climate columns: tmax_normal_01, tmax_normal_07, tmax_2025_01, and tmax_2025_07. Wide format is convenient because every county has the same fixed set of climate measurements (two months × two variables), so a single row per county is the most compact and readable layout. I pivoted climate_df with pivot_wider() and joined it to the counties sf object by GEOID using left_join(), preserving the geometry column.**
 
 ## (2) Presenting your data
 
 ### (2a) January climate normal
 
-Map the January climate normal from 1990 to 2020 at the county level. Make the map presentable. You can use nicer color scales than the default; consider `scale_fill_viridis_c()`, for example. You might also center the title using `theme()` commands. Or, you could get rid of the grid lines and axis text. It is up to you. 
+Map the January climate normal from 1990 to 2020 at the county level. Make the map presentable. You can use nicer color scales than the default; consider `scale_fill_viridis_c()`, for example. You might also center the title using `theme()` commands. Or, you could get rid of the grid lines and axis text. It is up to you.
 
-Which areas have the harshest winters? 
+Which areas have the harshest winters?
 
-**Written answer here.**
+```{r map_jan_normal}
+ggplot(counties) +
+  geom_sf(aes(fill = tmax_normal_01), color = NA) +
+  scale_fill_viridis_c(option = "magma", name = "°C") +
+  labs(
+    title    = "January climate normal (1990–2020)",
+    subtitle = "Average daily maximum temperature, contiguous U.S.",
+    caption  = "Source: PRISM Climate Group"
+  ) +
+  theme_void() +
+  theme(
+    plot.title    = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5),
+    plot.caption  = element_text(hjust = 0.5, size = 8),
+    legend.position = "right"
+  )
+```
+
+**The harshest winters — the darkest counties on the map — are concentrated in the Upper Midwest and Northern Plains (North Dakota, Minnesota, northern Wisconsin and Michigan), the Northern Rockies (Montana, Wyoming, northern Idaho), and high-elevation parts of Colorado.**
 
 ### (2b) July climate normal
 
-Map the July climate normal from 1990 to 2020. Make the map presentable. Which areas have the mildest summers? 
+Map the July climate normal from 1990 to 2020. Make the map presentable. Which areas have the mildest summers?
 
-**Written answer here.**
+```{r map_jul_normal}
+ggplot(counties) +
+  geom_sf(aes(fill = tmax_normal_07), color = NA) +
+  scale_fill_viridis_c(option = "inferno", name = "°C") +
+  labs(
+    title    = "July climate normal (1990–2020)",
+    subtitle = "Average daily maximum temperature, contiguous U.S.",
+    caption  = "Source: PRISM Climate Group"
+  ) +
+  theme_void() +
+  theme(
+    plot.title    = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5),
+    plot.caption  = element_text(hjust = 0.5, size = 8),
+    legend.position = "right"
+  )
+```
+
+**The mildest summers — the darkest counties on the map — sit along the Pacific Northwest coast (coastal Washington, Oregon, and northern California), the high-elevation Rockies, and the upper tier of New England. **
 
 ### (2c) January 2025
 
-Map the difference between January 2025 and the climate normal for 1990 to 2020. Which areas had a relatively warm January? 
+Map the difference between January 2025 and the climate normal for 1990 to 2020. Which areas had a relatively warm January?
 
-**Written answer here.**
+```{r map_jan_anom}
+counties <- counties %>%
+  mutate(jan_anom = tmax_2025_01 - tmax_normal_01)
+
+ggplot(counties) +
+  geom_sf(aes(fill = jan_anom), color = NA) +
+  scale_fill_gradient2(
+    low      = "steelblue",
+    mid      = "white",
+    high     = "firebrick",
+    midpoint = 0,
+    name     = "°C\nanomaly"
+  ) +
+  labs(
+    title    = "January 2025 anomaly vs. 1990–2020 normal",
+    subtitle = "Positive = warmer than normal",
+    caption  = "Source: PRISM Climate Group"
+  ) +
+  theme_void() +
+  theme(
+    plot.title    = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5),
+    plot.caption  = element_text(hjust = 0.5, size = 8),
+    legend.position = "right"
+  )
+```
+
+**jan_anom = tmax_2025_01 - tmax_normal_01; positive values are counties warmer than their 1990–2020 January normal. A diverging red–white–blue scale centered at zero makes the sign easy to read. Relative to normal, January 2025 was warmest across the Northern Plains and Upper Midwest (the Dakotas, Minnesota, Wisconsin) and parts of the Northern Rockies, and coolest across the desert Southwest and southern Plains.**
 
 ### (2d) July 2025
 
-Map the difference between July 2025 and the climate normal for 1990 to 2020. Which areas had a relatively warm July? 
+Map the difference between July 2025 and the climate normal for 1990 to 2020. Which areas had a relatively warm July?
 
-**Written answer here.**
+```{r map_jul_anom}
+counties <- counties %>%
+  mutate(jul_anom = tmax_2025_07 - tmax_normal_07)
+
+ggplot(counties) +
+  geom_sf(aes(fill = jul_anom), color = NA) +
+  scale_fill_gradient2(
+    low      = "steelblue",
+    mid      = "white",
+    high     = "firebrick",
+    midpoint = 0,
+    name     = "°C\nanomaly"
+  ) +
+  labs(
+    title    = "July 2025 anomaly vs. 1990–2020 normal",
+    subtitle = "Positive = warmer than normal",
+    caption  = "Source: PRISM Climate Group"
+  ) +
+  theme_void() +
+  theme(
+    plot.title    = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5),
+    plot.caption  = element_text(hjust = 0.5, size = 8),
+    legend.position = "right"
+  )
+```
+
+**`jul_anom = tmax_2025_07 - tmax_normal_07`; positive values are counties warmer than their 1990–2020 July normal. July 2025 was warmer than normal across the Pacific Northwest (Oregon, Washington), the Southwest, and much of the eastern US. **
 
 ## (3) Relating population growth to climate
 
 ### (3a) Merging population
 
-It is a good idea to create a non-spatial dataframe for the regression work we will do. Create a new dataframe (something like `county_df`) where you use `st_drop_geometry()` to get rid of the spatial elements from the county shapefile. Merge the population on. You can also consider dropping extraneous columns. Print your data. 
+It is a good idea to create a non-spatial dataframe for the regression work we will do. Create a new dataframe (something like `county_df`) where you use `st_drop_geometry()` to get rid of the spatial elements from the county shapefile. Merge the population on. You can also consider dropping extraneous columns. Print your data.
 
-**Written answer here.**
+```{r county_df}
+county_df <- counties %>%
+  st_drop_geometry() %>%
+  left_join(county_pop %>% select(GEOID, pop_2000, pop_2020), by = "GEOID") %>%
+  mutate(pop_pct_change = 100 * (pop_2020 - pop_2000) / pop_2000) %>%
+  select(GEOID, NAME, STATEFP,
+         pop_2000, pop_2020, pop_pct_change,
+         tmax_normal_01, tmax_normal_07,
+         tmax_2025_01,   tmax_2025_07,
+         jan_anom, jul_anom)
+
+county_df
+```
+
+**I dropped the geometry with `st_drop_geometry()` to get a plain tibble, joined the 2000 and 2020 population counts from `county_pop` by `GEOID`, and computed `pop_pct_change` as the percent change between the two censuses — this will be the outcome in the regressions. I kept only the columns the regression work needs (identifiers, population, and the four climate variables plus the two anomalies) and dropped Census fields like `COUNTYFP`, `COUNTYNS`, `AFFGEOID`, `LSAD`, and `ALAND`/`AWATER`.**
 
 ### (3b) Regressing population change on climate
 
-Run three regressions. First, regress the percent population change from 2000 to 2020 on January climate normal plus January climate normal squared. Next, do the same for July. Finally, include all of the variables (January and July) in a third regression. Output the results to a regression table. Can you conclude anything from these regressions? 
+Run three regressions. First, regress the percent population change from 2000 to 2020 on January climate normal plus January climate normal squared. Next, do the same for July. Finally, include all of the variables (January and July) in a third regression. Output the results to a regression table. Can you conclude anything from these regressions?
 
-**Written answer here.**
+```{r reg_normal}
+m_jan <- lm(pop_pct_change ~ tmax_normal_01 + I(tmax_normal_01^2),
+            data = county_df)
+m_jul <- lm(pop_pct_change ~ tmax_normal_07 + I(tmax_normal_07^2),
+            data = county_df)
+m_both <- lm(pop_pct_change ~ tmax_normal_01 + I(tmax_normal_01^2) +
+                              tmax_normal_07 + I(tmax_normal_07^2),
+             data = county_df)
+
+modelsummary(
+  list("January only" = m_jan,
+       "July only"    = m_jul,
+       "Both"         = m_both),
+  stars   = TRUE,
+  gof_map = c("nobs", "r.squared", "adj.r.squared"),
+  coef_rename = c(
+    "tmax_normal_01"      = "January tmax normal",
+    "I(tmax_normal_01^2)" = "January tmax normal²",
+    "tmax_normal_07"      = "July tmax normal",
+    "I(tmax_normal_07^2)" = "July tmax normal²"
+  ),
+  title = "Population % change (2000–2020) on climate normals"
+)
+```
+
+**January and July climate normals are both statistically associated with population growth, but the relationships are non-linear. Warmer winters (January) are associated with faster growth in a convex pattern, while July shows a U-shaped relationship where moderate summer heat is most associated with slower growth. When combined, January dominates and July loses significance. R² values are low (~0.03–0.05), so climate explains little of the overall variation, and these results reflect correlation rather than causation.**
 
 ### (3c) Investigating "warming" and population growth
 
-Consider an "ad hoc" measure of warming, which is the 2025 temperature minus the 1990-2020 normal. Does this measure correlate with population change for either January or July "warming"? Is this enough evidence to say anything about warming and population growth with this "ad hoc" measure? Use a regression table like in (3d) to provide an answer. 
+Consider an "ad hoc" measure of warming, which is the 2025 temperature minus the 1990-2020 normal. Does this measure correlate with population change for either January or July "warming"? Is this enough evidence to say anything about warming and population growth with this "ad hoc" measure? Use a regression table like in (3d) to provide an answer.
 
-**Written answer here.**
+```{r reg_warming}
+m_jan_w  <- lm(pop_pct_change ~ jan_anom, data = county_df)
+m_jul_w  <- lm(pop_pct_change ~ jul_anom, data = county_df)
+m_both_w <- lm(pop_pct_change ~ jan_anom + jul_anom, data = county_df)
+
+modelsummary(
+  list("January warming" = m_jan_w,
+       "July warming"    = m_jul_w,
+       "Both"            = m_both_w),
+  stars   = TRUE,
+  gof_map = c("nobs", "r.squared", "adj.r.squared"),
+  coef_rename = c(
+    "jan_anom" = "January warming (°C)",
+    "jul_anom" = "July warming (°C)"
+  ),
+  title = "Population % change (2000–2020) on ad hoc warming"
+)
+```
+
+**The ad hoc warming measure (2025 tmax minus 1990–2020 normal) shows no significant association with population growth for January and a small positive association for July. However, this is not credible evidence about warming and population growth. The outcome (population change 2000–2020) was already realized before 2025, so the temporal ordering is backwards — 2025 temperatures cannot have caused earlier migration. A single year of anomalies also reflects weather noise rather than long-run climate change. This measure is not a valid test of whether warming affects population growth.**
 
 ### (3d) A more sophisticated approach
 
-Come up with a more sophisticated econometric method than just regressing on temperature + temperature squared. Present the results in a figure or table. 
+Come up with a more sophisticated econometric method than just regressing on temperature + temperature squared. Present the results in a figure or table.
 
-**Written answer here.**
+```{r reg_sophisticated}
+# baseline (same as (3b) "Both") — pooled OLS, no controls
+m_base <- lm(
+  pop_pct_change ~ tmax_normal_01 + I(tmax_normal_01^2) +
+                   tmax_normal_07 + I(tmax_normal_07^2),
+  data = county_df
+)
+
+# add state fixed effects
+m_fe <- lm(
+  pop_pct_change ~ tmax_normal_01 + I(tmax_normal_01^2) +
+                   tmax_normal_07 + I(tmax_normal_07^2) +
+                   factor(STATEFP),
+  data = county_df
+)
+
+# add state FE + initial population (mean-reversion control)
+m_fe_pop <- lm(
+  pop_pct_change ~ tmax_normal_01 + I(tmax_normal_01^2) +
+                   tmax_normal_07 + I(tmax_normal_07^2) +
+                   log(pop_2000) + factor(STATEFP),
+  data = county_df
+)
+
+modelsummary(
+  list("Pooled OLS"          = m_base,
+       "+ State FE"          = m_fe,
+       "+ State FE + log pop 2000" = m_fe_pop),
+  stars     = TRUE,
+  coef_omit = "factor\\(STATEFP\\)",
+  gof_map   = c("nobs", "r.squared", "adj.r.squared"),
+  coef_rename = c(
+    "tmax_normal_01"      = "January tmax normal",
+    "I(tmax_normal_01^2)" = "January tmax normal²",
+    "tmax_normal_07"      = "July tmax normal",
+    "I(tmax_normal_07^2)" = "July tmax normal²",
+    "log(pop_2000)"       = "log(pop 2000)"
+  ),
+  add_rows = tibble::tribble(
+    ~term,                ~`Pooled OLS`, ~`+ State FE`, ~`+ State FE + log pop 2000`,
+    "State fixed effects", "No",          "Yes",         "Yes"
+  ),
+  title = "Population % change (2000–2020) — more sophisticated specifications"
+)
+```
+
+**
+I present three progressive specifications: pooled OLS, OLS with state fixed effects, and OLS with state fixed effects plus log population in 2000. Compared to the simple regressions in (3b), adding state fixed effects substantially weakens the climate coefficients — January shrinks and July becomes fully insignificant. Once log population in 2000 is added, all climate terms lose significance except January tmax normal², which remains marginally significant and negative, suggesting a slight concavity in the January-growth relationship even after controls. Log population is strongly positive and dominant, and R² rises substantially across columns, showing that initial county size explains far more of population growth than climate. The contrast with (3b) is stark: the apparent climate-growth relationship was largely driven by state-level confounders and initial population size, not temperature itself.**
+
+## AI Use Disclosure
+
+I used Claude Code, a terminal-based AI assistant running directly inside RStudio, to help debug my code. This was genuinely new to me and I learned it through the workflow you showed us in the last class. Throughout the assignment, I understood what each chunk was doing and made judgment calls on the written interpretations myself, using the AI as a sounding board rather than a solution generator.
